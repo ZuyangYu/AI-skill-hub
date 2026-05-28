@@ -10,12 +10,31 @@ import os
 import re
 import sys
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 
 IMAGE_MIN_BYTES = 5_000
+
+
+def is_supported_image(body: bytes) -> bool:
+    return (
+        body.startswith(b"\xff\xd8\xff")
+        or body.startswith(b"\x89PNG\r\n\x1a\n")
+        or (len(body) > 12 and body[:4] == b"RIFF" and body[8:12] == b"WEBP")
+    )
+
+
+def image_extension(body: bytes) -> str:
+    if body.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    if body.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    if len(body) > 12 and body[:4] == b"RIFF" and body[8:12] == b"WEBP":
+        return ".webp"
+    return ".img"
 
 
 @dataclass
@@ -27,6 +46,7 @@ class ScrapeConfig:
     headed: bool = False
     timeout_ms: int = 90_000
     image_width: int = 1400
+    max_colors: int | None = None
 
 
 def slugify(value: str, fallback: str = "product") -> str:
@@ -91,6 +111,9 @@ async def launch_page(config: ScrapeConfig):
 
 
 async def extract_page_data(page, config: ScrapeConfig) -> dict[str, Any]:
+    if config.site == "patagonia":
+        await expand_patagonia_details(page)
+
     data = await page.evaluate(
         """() => {
         const text = document.body ? document.body.innerText : "";
@@ -145,7 +168,7 @@ async def extract_page_data(page, config: ScrapeConfig) -> dict[str, Any]:
             title: meta("og:title") || meta("twitter:title"),
             description: meta("description") || meta("og:description"),
             image: meta("og:image") || meta("twitter:image"),
-            price: meta("product:price:amount"),
+          price: meta("product:price:amount") || meta("og:price:amount"),
             currency: meta("product:price:currency")
           },
           jsonLd,
@@ -171,6 +194,7 @@ async def extract_page_data(page, config: ScrapeConfig) -> dict[str, Any]:
         "materials": "",
         "care_instructions": [],
         "certifications": [],
+        "variants": [],
         "images": [],
         "raw": {"meta": data.get("meta"), "json_ld": data.get("jsonLd")},
     }
@@ -207,9 +231,9 @@ def apply_json_ld(product: dict[str, Any], json_ld: list[dict[str, Any]]) -> Non
     for item in candidates:
         item_type = item.get("@type", "")
         if isinstance(item_type, list):
-            is_product = "Product" in item_type
+            is_product = "Product" in item_type or "ProductGroup" in item_type
         else:
-            is_product = item_type == "Product"
+            is_product = item_type in {"Product", "ProductGroup"}
         if not is_product:
             continue
 
@@ -230,6 +254,43 @@ def apply_json_ld(product: dict[str, Any], json_ld: list[dict[str, Any]]) -> Non
                 "currency": offers.get("priceCurrency", "") if isinstance(offers, dict) else "",
             },
         )
+        if item_type == "ProductGroup" and item.get("productGroupID"):
+            product["product_id"] = str(item["productGroupID"])
+            product["style_number"] = str(item["productGroupID"])
+            colors = item.get("color") or []
+            if isinstance(colors, list):
+                product["raw"]["jsonld_colors"] = colors
+        elif item.get("sku") or item.get("mpn"):
+            sku = str(item.get("sku") or item.get("mpn"))
+            color_code = sku.split("-")[-1] if "-" in sku else ""
+            variant = {
+                "sku": sku,
+                "color_code": color_code,
+                "color": item.get("color", ""),
+                "price": str(offers.get("price", "")) if isinstance(offers, dict) else "",
+                "currency": offers.get("priceCurrency", "") if isinstance(offers, dict) else "",
+                "availability": offers.get("availability", "") if isinstance(offers, dict) else "",
+                "url": offers.get("url", "") if isinstance(offers, dict) else "",
+                "image": item.get("image") or (offers.get("image", "") if isinstance(offers, dict) else ""),
+            }
+            if not any(v.get("sku") == sku for v in product["variants"]):
+                product["variants"].append(variant)
+            if color_code and variant.get("color") and not product["color_names"].get(color_code):
+                product["color_names"][color_code] = variant["color"]
+
+    if product.get("color_code") and product.get("variants"):
+        selected = next(
+            (v for v in product["variants"] if v.get("color_code") == product["color_code"]),
+            None,
+        )
+        if selected:
+            merge_missing(
+                product,
+                {
+                    "price": selected.get("price"),
+                    "currency": selected.get("currency"),
+                },
+            )
 
 
 def apply_text_heuristics(product: dict[str, Any], text: str, site: str) -> None:
@@ -248,19 +309,24 @@ def apply_text_heuristics(product: dict[str, Any], text: str, site: str) -> None
         weight_match = re.search(r"Weight\s+(\d+)\s*g\s*\(([^)]+)\)", text)
         origin_match = re.search(r"Country of Origin\s+(Made in [^\n.]+)", text)
         materials_match = re.search(
-            r"Materials[\s\S]*?Instructions[\s\S]*?(\d+(?:\.\d+)?-oz[^\n.]{0,180})",
+            r"Materials(?:\s*&\s*Care Instructions)?[\s\S]{0,1200}?(\d+(?:\.\d+)?-oz[^\n.]{0,220})",
             text,
+            re.IGNORECASE,
         )
         care_match = re.search(
-            r"Materials[^]*?Instructions[\s\S]{0,500}?(Machine [^.]+\.?)",
+            r"(Machine Wash[^\n.]+(?:\.|$))",
             text,
+            re.IGNORECASE,
         )
+        features = extract_patagonia_features(text)
 
         facts = []
         if fit_match:
             facts.append({"name": "fit", "value": fit_match.group(1)})
         if weight_match:
             facts.append({"name": "weight", "value": f"{weight_match.group(1)} g ({weight_match.group(2)})"})
+        elif weight_from_feature := re.search(r"\b(\d+)\s*g\s*\(([^)]+oz)\)", text):
+            facts.append({"name": "weight", "value": f"{weight_from_feature.group(1)} g ({weight_from_feature.group(2)})"})
         if origin_match:
             facts.append({"name": "origin", "value": origin_match.group(1)})
         product["raw"]["facts"] = facts
@@ -271,13 +337,80 @@ def apply_text_heuristics(product: dict[str, Any], text: str, site: str) -> None
             product["care_instructions"] = [
                 normalize_space(part) for part in care_match.group(1).split(",") if normalize_space(part)
             ]
+        if features and not product.get("features"):
+            product["features"] = features
         if "Fair Trade Certified" in text:
             product["certifications"].append("Fair Trade Certified")
         if "bluesign" in text:
             product["certifications"].append("bluesign approved")
 
 
+async def expand_patagonia_details(page) -> None:
+    await page.evaluate(
+        """() => {
+        const labels = [
+          "Specs & Features",
+          "Materials",
+          "Materials & Care Instructions",
+          "Fit",
+          "Reviews"
+        ];
+        for (const label of labels) {
+          const candidates = [...document.querySelectorAll("button, summary, [role='button']")];
+          for (const el of candidates) {
+            const text = (el.innerText || el.getAttribute("aria-label") || "").trim();
+            if (text.includes(label) && el.getAttribute("aria-expanded") !== "true") {
+              try { el.click(); } catch (e) {}
+            }
+          }
+        }
+    }"""
+    )
+    await page.wait_for_timeout(1_000)
+
+
+def extract_patagonia_features(text: str) -> list[dict[str, str]]:
+    match = re.search(
+        r"Specs\s*&\s*Features([\s\S]+?)(?:Materials\s*&\s*Care Instructions|Materials|Reviews|$)",
+        text,
+        re.IGNORECASE,
+    )
+    if not match:
+        return []
+
+    skip = {
+        "Specs & Features",
+        "Care Instructions",
+        "Country of Origin",
+        "Weight",
+        "Fit",
+        "Materials",
+    }
+    lines = [normalize_space(line) for line in match.group(1).splitlines()]
+    lines = [line for line in lines if line and line not in skip]
+
+    features: list[dict[str, str]] = []
+    i = 0
+    while i < len(lines):
+        title = lines[i]
+        if re.fullmatch(r"\d+\s*g\s*\([^)]+oz\)", title):
+            i += 1
+            continue
+        if len(title) <= 90 and not re.search(r"[.!?]$", title):
+            desc = ""
+            if i + 1 < len(lines) and len(lines[i + 1]) > 40:
+                desc = lines[i + 1]
+                i += 1
+            if title not in {f["title"] for f in features}:
+                features.append({"title": title, "description": desc})
+        i += 1
+
+    return features[:12]
+
+
 async def setup_patagonia_capture(page, config: ScrapeConfig, captured: dict[str, bytes]) -> None:
+    expected_id = extract_product_id(config.url, site="patagonia")
+
     async def route_upgrade(route):
         url = route.request.url
         if "BDJB_PRD" in url and "sw=" in url:
@@ -291,11 +424,13 @@ async def setup_patagonia_capture(page, config: ScrapeConfig, captured: dict[str
         url = response.url
         if "BDJB_PRD" not in url or "hi-res" not in url:
             return
+        if expected_id and expected_id not in url:
+            return
         try:
             body = await response.body()
         except Exception:
             return
-        if len(body) < IMAGE_MIN_BYTES:
+        if len(body) < IMAGE_MIN_BYTES or not is_supported_image(body):
             return
         match = re.search(r"/([^/?#]+)\.jpg", url)
         if not match:
@@ -349,7 +484,10 @@ async def scrape(config: ScrapeConfig) -> dict[str, Any]:
             current = product.get("color_code")
             ordered = ([current] if current else []) + [c for c in colors if c != current]
             valid_colors = []
-            for color in ordered[1:]:
+            variant_colors = ordered[1:]
+            if config.max_colors is not None:
+                variant_colors = variant_colors[: config.max_colors]
+            for color in variant_colors:
                 before = len(captured)
                 await page.goto(
                     patagonia_variant_url(config.url, product.get("style_number") or product["product_id"], color),
@@ -387,7 +525,9 @@ async def scrape(config: ScrapeConfig) -> dict[str, Any]:
 def save_captured_images(product: dict[str, Any], image_dir: Path, captured: dict[str, bytes]) -> None:
     saved_images = []
     for name, body in captured.items():
-        filename = f"{name}.jpg"
+        if not is_supported_image(body):
+            continue
+        filename = f"{name}{image_extension(body)}"
         path = image_dir / filename
         if not path.exists() or path.stat().st_size < len(body):
             path.write_bytes(body)
@@ -399,6 +539,7 @@ def save_captured_images(product: dict[str, Any], image_dir: Path, captured: dic
 def write_docx(product: dict[str, Any], output_path: Path, image_dir: Path) -> None:
     from docx import Document
     from docx.shared import Inches
+    from PIL import Image
 
     doc = Document()
     doc.add_heading(product.get("name") or product.get("product_id") or "Product", level=1)
@@ -436,9 +577,25 @@ def write_docx(product: dict[str, Any], output_path: Path, image_dir: Path) -> N
             path = image_dir / image["filename"]
             if path.exists():
                 doc.add_paragraph(image["filename"])
-                doc.add_picture(str(path), width=Inches(3.0))
+                try:
+                    doc.add_picture(str(path), width=Inches(3.0))
+                except Exception:
+                    converted = path.with_suffix(path.suffix + ".png")
+                    try:
+                        with Image.open(path) as source:
+                            source.convert("RGB").save(converted, "PNG")
+                        doc.add_picture(str(converted), width=Inches(3.0))
+                    finally:
+                        if converted.exists():
+                            converted.unlink()
 
-    doc.save(output_path)
+    try:
+        doc.save(output_path)
+    except PermissionError:
+        fallback = output_path.with_name(
+            f"{output_path.stem}_{datetime.now().strftime('%Y%m%d_%H%M%S')}{output_path.suffix}"
+        )
+        doc.save(fallback)
 
 
 def parse_args(argv: list[str]) -> ScrapeConfig:
@@ -450,6 +607,12 @@ def parse_args(argv: list[str]) -> ScrapeConfig:
     parser.add_argument("--headed", action="store_true")
     parser.add_argument("--timeout-ms", type=int, default=90_000)
     parser.add_argument("--image-width", type=int, default=1400)
+    parser.add_argument(
+        "--max-colors",
+        type=int,
+        default=None,
+        help="Maximum additional color variants to visit; use 0 for a fast current-page smoke test.",
+    )
     args = parser.parse_args(argv)
     return ScrapeConfig(
         url=args.url,
@@ -459,6 +622,7 @@ def parse_args(argv: list[str]) -> ScrapeConfig:
         headed=args.headed,
         timeout_ms=args.timeout_ms,
         image_width=args.image_width,
+        max_colors=args.max_colors,
     )
 
 
