@@ -1,0 +1,7 @@
+interface:
+  display_name: "Patagonia Scraper"
+  short_description: "Scrape product data, images, and docs"
+  default_prompt: "Use $patagonia-scraper to extract product data, images, and a Word document from this ecommerce product URL."
+
+policy:
+  allow_implicit_invocation: true
