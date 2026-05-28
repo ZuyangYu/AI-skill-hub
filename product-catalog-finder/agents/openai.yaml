@@ -1,0 +1,7 @@
+interface:
+  display_name: "Product Catalog Finder"
+  short_description: "Find cached product info and images"
+  default_prompt: "Use $product-catalog-finder to find cached product information, images, and documents from my local scraped product data."
+
+policy:
+  allow_implicit_invocation: true
