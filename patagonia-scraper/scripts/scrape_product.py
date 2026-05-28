@@ -47,6 +47,7 @@ class ScrapeConfig:
     timeout_ms: int = 90_000
     image_width: int = 1400
     max_colors: int | None = None
+    update_index: bool = True
 
 
 def slugify(value: str, fallback: str = "product") -> str:
@@ -514,6 +515,8 @@ async def scrape(config: ScrapeConfig) -> dict[str, Any]:
             )
         if "docx" in config.outputs:
             write_docx(product, product_dir / "product.docx", image_dir)
+        if config.update_index:
+            update_catalog_index(product, product_dir, image_dir, config.output_root)
 
         return product
     finally:
@@ -534,6 +537,98 @@ def save_captured_images(product: dict[str, Any], image_dir: Path, captured: dic
         saved_images.append({"filename": filename, "path": str(path), "source": "browser-response"})
     if saved_images:
         product["images"] = saved_images + product.get("images", [])
+
+
+def update_catalog_index(product: dict[str, Any], product_dir: Path, image_dir: Path, output_root: Path) -> None:
+    index_path = output_root / "catalog_index.json"
+    now = datetime.now().astimezone().isoformat(timespec="seconds")
+
+    index = {"updated_at": now, "products": []}
+    if index_path.exists():
+        try:
+            index = json.loads(index_path.read_text(encoding="utf-8"))
+            if not isinstance(index, dict):
+                index = {"updated_at": now, "products": []}
+            if not isinstance(index.get("products"), list):
+                index["products"] = []
+        except json.JSONDecodeError:
+            index = {"updated_at": now, "products": []}
+
+    local_images = [img for img in product.get("images", []) if img.get("filename")]
+    variants = product.get("variants") or []
+    variant_colors = [v.get("color_code") for v in variants if v.get("color_code")]
+    raw_colors = product.get("raw", {}).get("discovered_colors") or product.get("raw", {}).get("jsonld_colors") or []
+    colors = sorted(dict.fromkeys([c for c in [*variant_colors, *raw_colors] if c]))
+    color_names = {k: v for k, v in (product.get("color_names") or {}).items() if v}
+    category = extract_category(product.get("source_url", ""))
+
+    record = {
+        "product_id": product.get("product_id", ""),
+        "style_number": product.get("style_number", ""),
+        "name": product.get("name", ""),
+        "brand": product.get("brand", ""),
+        "site": product.get("site", ""),
+        "source_url": product.get("source_url", ""),
+        "category": category,
+        "price": product.get("price", ""),
+        "currency": product.get("currency", ""),
+        "colors": colors,
+        "color_names": color_names,
+        "variant_count": len(variants),
+        "image_count": len(local_images),
+        "json_path": str(product_dir / "product.json"),
+        "docx_path": str(product_dir / "product.docx"),
+        "image_dir": str(image_dir),
+        "keywords": build_keywords(product, category),
+        "last_scraped_at": now,
+    }
+
+    products = [
+        item
+        for item in index.get("products", [])
+        if item.get("product_id") != record["product_id"] or item.get("site") != record["site"]
+    ]
+    products.append(record)
+    products.sort(key=lambda item: (item.get("site", ""), item.get("product_id", "")))
+    index["updated_at"] = now
+    index["products"] = products
+
+    output_root.mkdir(parents=True, exist_ok=True)
+    index_path.write_text(json.dumps(index, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def extract_category(url: str) -> str:
+    parsed = urlparse(url)
+    query = parse_qs(parsed.query)
+    if query.get("cgid"):
+        return query["cgid"][0]
+    bits = [bit for bit in parsed.path.split("/") if bit]
+    if "shop" in bits:
+        return "-".join(bits[bits.index("shop") + 1 :])
+    return ""
+
+
+def build_keywords(product: dict[str, Any], category: str) -> list[str]:
+    values: list[str] = [
+        product.get("product_id", ""),
+        product.get("style_number", ""),
+        product.get("name", ""),
+        product.get("brand", ""),
+        category,
+    ]
+    values.extend((product.get("color_names") or {}).keys())
+    values.extend((product.get("color_names") or {}).values())
+    for variant in product.get("variants") or []:
+        values.extend([variant.get("sku", ""), variant.get("color_code", ""), variant.get("color", "")])
+
+    keywords = []
+    seen = set()
+    for value in values:
+        normalized = normalize_space(str(value)).lower()
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            keywords.append(normalized)
+    return keywords
 
 
 def write_docx(product: dict[str, Any], output_path: Path, image_dir: Path) -> None:
@@ -613,6 +708,11 @@ def parse_args(argv: list[str]) -> ScrapeConfig:
         default=None,
         help="Maximum additional color variants to visit; use 0 for a fast current-page smoke test.",
     )
+    parser.add_argument(
+        "--no-index",
+        action="store_true",
+        help="Do not update catalog_index.json after scraping.",
+    )
     args = parser.parse_args(argv)
     return ScrapeConfig(
         url=args.url,
@@ -623,6 +723,7 @@ def parse_args(argv: list[str]) -> ScrapeConfig:
         timeout_ms=args.timeout_ms,
         image_width=args.image_width,
         max_colors=args.max_colors,
+        update_index=not args.no_index,
     )
 
 
@@ -636,6 +737,7 @@ def main(argv: list[str] | None = None) -> int:
         "name": product.get("name"),
         "image_count": len(product.get("images", [])),
         "output_root": str(config.output_root / product.get("product_id", "")),
+        "index_path": str(config.output_root / "catalog_index.json") if config.update_index else "",
     }, ensure_ascii=False, indent=2))
     return 0
 

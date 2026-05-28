@@ -13,8 +13,9 @@ Use this skill to turn ecommerce product pages into structured product data, dow
 2. Use `scripts/scrape_product.py` as the first implementation path.
 3. For Patagonia URLs, use `--site patagonia` so the script enables Demandware image capture and color-variant handling.
 4. Save outputs under `scraped_data/{product_id}/`.
-5. If the script misses fields, inspect the page with Playwright and patch the smallest site-specific extractor.
-6. Keep fragile site behavior in `references/`, not in this file.
+5. Let the script update `scraped_data/catalog_index.json` by default so finder/search skills can query cached products before scraping again.
+6. If the script misses fields, inspect the page with Playwright and patch the smallest site-specific extractor.
+7. Keep fragile site behavior in `references/`, not in this file.
 
 ## Bundled Resources
 
@@ -49,17 +50,26 @@ Use a visible browser if the site blocks headless mode:
 python scripts/scrape_product.py "https://www.patagonia.com/..." --site patagonia --headed
 ```
 
+Skip index updates only for disposable tests:
+
+```bash
+python scripts/scrape_product.py "https://www.patagonia.com/..." --site patagonia --no-index
+```
+
 ## Output Contract
 
 Store one product per folder:
 
 ```text
 scraped_data/
+├── catalog_index.json
 └── {product_id}/
     ├── images/
     ├── product.json
     └── product.docx
 ```
+
+`catalog_index.json` is maintained by the scraper after each successful run. Use it as the fast lookup surface for catalog/search skills. It should contain one record per product/site pair with product identity, category, paths, colors, keywords, image count, and `last_scraped_at`.
 
 `product.json` should include these stable top-level keys when available:
 
@@ -78,6 +88,7 @@ scraped_data/
 - `materials`
 - `care_instructions`
 - `certifications`
+- `variants`
 - `images`
 - `raw`
 
